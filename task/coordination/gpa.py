@@ -1,3 +1,18 @@
+"""
+GPA Gateway - Interface to the General-Purpose Agent.
+
+Execution Flow:
+1. Filter message history to include only GPA-relevant messages (restore tool call state)
+2. Augment last user message with coordinator instructions
+3. Call GPA via AsyncDial client with streaming enabled
+4. Process streaming chunks: content, attachments, and stage propagation
+5. Mirror GPA stages to coordinator stages for UI visibility
+6. Persist GPA state (tool calls) in choice for conversation continuity
+
+External I/O: HTTP calls to GPA endpoint via aidial_client
+Side Effects: Opens/closes stages on choice, sets state and custom_content
+"""
+
 from copy import deepcopy
 from typing import Optional, Any
 
@@ -7,13 +22,24 @@ from pydantic import StrictStr
 
 from task.stage_util import StageProcessor
 
+# State keys for identifying and restoring GPA conversation context
 _IS_GPA = "is_gpa"
 _GPA_MESSAGES = "gpa_messages"
 
 
 class GPAGateway:
+    """
+    Gateway for communicating with the General-Purpose Agent.
+    Handles stage propagation, attachment forwarding, and tool call state restoration.
+    """
 
     def __init__(self, endpoint: str):
+        """
+        Initialize gateway with DIAL endpoint.
+        
+        Args:
+            endpoint: DIAL Core endpoint URL (e.g., http://localhost:8080)
+        """
         self.endpoint = endpoint
 
     async def response(
@@ -23,64 +49,150 @@ class GPAGateway:
             request: Request,
             additional_instructions: Optional[str]
     ) -> Message:
-        #TODO:
-        # ℹ️ Cool thing about DIAL that all the apps that implement /chat/completions endpoint within DIAL infrastructure
-        #    can be openai compatible and DIAL SDK supports us with creation of such applications. So, we can use any
-        #    OpenAI compatible client (from openai, azureopenai, langchain, whatever...) and communicate with it like
-        #    with openai LLM through /chat/completions endpoint.
-        #    BZW this app as well implements /chat/completions endpoint.
-        # ---
-        # 1. Create AsyncDial (api_version='2025-01-01-preview')
-        # 2. Make call, you will need to provide such parameters:
-        #       - it should stream response
-        #       - prepared messages with `additional_instructions`
-        #       - `general-purpose-agent` is deployment name that we will call
-        #          Full final URL will be `http://host.docker.internal:8052/openai/deployments/general-purpose-agent/chat/completions`
-        #       - extra_headers={'x-conversation-id': request.headers.get('x-conversation-id')}
-        #         Extra headers are required in this case since we have the logic in GPA for RAG that requires them
-        # 3. Create such variables:
-        #       - content, here we will collect content
-        #       - result_custom_content: CustomContent with empty attachment list, here we will collect attachments
-        #       - stages_map: dict[int, Stage] = {}, here we will the mirrored stages by their indexes
-        # 4. Make async loop through chunks and:
-        #       - get delta and print it to console it will later help you to see what is coming in response from GPA
-        #       - if delta has content append it to the `stage`
-        #       - if delta has custom_content it is time for magic✨
-        #           - if custom_content has attachments then add them to the `result_custom_content` (we will deal with them later)
-        #           - if custom_content has state, as well add it to `result_custom_content`. It is important for us
-        #             since here persisted all the tool calls information that is required to GPA to restore the context
-        #           - And now is magic, we will propagate stages from GPA to out MAS coordinator:
-        #               - make dict with none excluded from the custom_content
-        #               - if it has 'stages':
-        #                   - iterate through them (iterated stage we will name as `stg`) and:
-        #                       - get 'index' from it (each stage has it is index, it is required param)
-        #                       - if `stages_map` contains Stage by such index then:
-        #                           - if `stg` has 'content' then append it to the Stage by index
-        #                           - if `stg` has 'attachments' then iterate through these attachments and add them to the Stage by index
-        #                           - if stg` has 'status' and it is 'completed' then close the stage by index (StageProcessor.close_stage_safely)
-        #                       - otherwise: we need to open the Stage on our side to propagate GPA Stage data, use
-        #                         StageProcessor and don't forget to put it to the `stages_map` by index
-        # 5. Propagate `result_custom_content` to choice.
-        #    ⚠️ Here is the moment that aidial_client.AsyncDial and aidial_sdk has different pydentic models (classes)
-        #       for Attachment, so, you can make such move to handle it `Attachment(**attachment.dict(exclude_none=True))`
-        # 6. Now we need to to save information about conversation with GPA to the MASCoordinator choice state. Create
-        #    dict {_IS_GPA: True, GPA_MESSAGES: result_custom_content.state} and set it to the choice state.
-        # 7. Return assistant message with content
-        raise NotImplementedError()
+        """
+        Send user request to GPA and stream the response with full DIAL feature support.
+        
+        Key Features:
+        - Stage propagation: GPA's internal stages are mirrored to coordinator
+        - Attachment forwarding: Images/files from GPA appear in coordinator response
+        - State persistence: Tool call history preserved for multi-turn conversations
+        
+        Args:
+            choice: DIAL choice for state storage and custom content
+            stage: Parent stage to append content
+            request: Original request with message history
+            additional_instructions: Optional context from coordinator
+            
+        Returns:
+            Assistant message with GPA's response content
+        """
+        # Initialize AsyncDial client - compatible with OpenAI API
+        client = AsyncDial(base_url=self.endpoint, api_version='2025-01-01-preview')
+
+        # Prepare messages filtered to GPA-relevant history
+        messages = self.__prepare_gpa_messages(request, additional_instructions)
+
+        # Call GPA with streaming; x-conversation-id needed for RAG context
+        stream = await client.chat.completions.create(
+            stream=True,
+            messages=messages,
+            model="general-purpose-agent",
+            extra_headers={'x-conversation-id': request.headers.get('x-conversation-id', '')}
+        )
+
+        # Accumulators for streaming response
+        content = ""
+        result_custom_content = CustomContent(attachments=[])
+        stages_map: dict[int, Stage] = {}  # Track mirrored stages by index
+
+        # Process streaming chunks
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+            print(f"[GPA Delta] {delta}")  # Debug: observe incoming data structure
+
+            # Accumulate content and stream to stage
+            if delta.content:
+                content += delta.content
+                stage.append_content(delta.content)
+
+            # Handle custom_content: attachments, state, and stage propagation
+            if delta.custom_content:
+                # Forward attachments (images, files generated by GPA)
+                if delta.custom_content.attachments:
+                    for att in delta.custom_content.attachments:
+                        result_custom_content.attachments.append(att)
+
+                # Preserve GPA state (tool call history for conversation continuity)
+                if delta.custom_content.state:
+                    result_custom_content.state = delta.custom_content.state
+
+                # Stage propagation magic: mirror GPA's stages to coordinator
+                cc_dict = delta.custom_content.dict(exclude_none=True)
+                if 'stages' in cc_dict:
+                    for stg in cc_dict['stages']:
+                        idx = stg.get('index')
+                        if idx is None:
+                            continue
+
+                        if idx in stages_map:
+                            # Update existing mirrored stage
+                            mirrored_stage = stages_map[idx]
+                            if 'content' in stg:
+                                mirrored_stage.append_content(stg['content'])
+                            if 'attachments' in stg:
+                                for att_dict in stg['attachments']:
+                                    mirrored_stage.add_attachment(**att_dict)
+                            if stg.get('status') == 'completed':
+                                StageProcessor.close_stage_safely(mirrored_stage)
+                        else:
+                            # Open new mirrored stage with GPA's stage name
+                            stage_name = stg.get('name', f'GPA Stage {idx}')
+                            new_stage = StageProcessor.open_stage(choice, stage_name)
+                            stages_map[idx] = new_stage
+                            # Apply initial content if present
+                            if 'content' in stg:
+                                new_stage.append_content(stg['content'])
+
+        # Propagate custom_content to choice
+        # Note: aidial_client and aidial_sdk use different Pydantic models for Attachment
+        if result_custom_content.attachments:
+            for att in result_custom_content.attachments:
+                # Convert between SDK versions using dict serialization
+                choice.add_attachment(**att.dict(exclude_none=True))
+
+        # Save GPA state for future requests - enables multi-turn tool call conversations
+        gpa_state = {_IS_GPA: True, _GPA_MESSAGES: result_custom_content.state}
+        choice.set_state(gpa_state)
+
+        return Message(role=Role.ASSISTANT, content=content)
 
     def __prepare_gpa_messages(self, request: Request, additional_instructions: Optional[str]) -> list[dict[str, Any]]:
-        #TODO:
-        # 1. Create `res_messages` empty array, here we will collect all the messages that are related to the GPA agent
-        # 2. Make for i loop through range of len of request messages and:
-        #       - if it is assistant message then:
-        #           - Check if it has custom content and it has state:
-        #               - if state dict has `_IS_GPA` and it is true then:
-        #                   - 1. add to `res_messages` `request.messages[idx-1]` as dict with none excluded. Here we
-        #                     add user message
-        #                   - 2. make deepcopy of message, then set copied message with state from _GPA_MESSAGES add to
-        #                     `res_messages`. What we do here is to restore appropriate format of assistant message for
-        #                     GPA: {_IS_GPA: True, GPA_MESSAGES: {'tool_call_history': [{...}]}} -> {'tool_call_history': [{...}]}
-        # 3. Add last message from `additional_instructions` (it will be user message) as dict with none excluded
-        # 4. If `additional_instructions` are present we need to make augmentation for last message content in the `res_messages`
-        # 5. Return `res_messages`
-        raise NotImplementedError()
+        """
+        Prepare message history filtered to GPA-relevant context.
+        
+        GPA needs its tool call history restored for proper conversation continuity.
+        We identify GPA messages by the _IS_GPA flag in state and restore the
+        original state format (_GPA_MESSAGES) that GPA expects.
+        
+        Args:
+            request: Original request with full message history
+            additional_instructions: Optional context to augment last message
+            
+        Returns:
+            List of message dicts ready for GPA API call
+        """
+        res_messages: list[dict[str, Any]] = []
+
+        # Filter history to include only GPA-related exchanges
+        messages = request.messages
+        for idx in range(len(messages)):
+            msg = messages[idx]
+
+            # Check if this assistant message was from a GPA interaction
+            if msg.role == Role.ASSISTANT and msg.custom_content:
+                state = msg.custom_content.state
+                if state and state.get(_IS_GPA):
+                    # Include the preceding user message
+                    if idx > 0:
+                        res_messages.append(messages[idx - 1].dict(exclude_none=True))
+
+                    # Restore GPA's expected state format from our wrapped format
+                    msg_copy = deepcopy(msg)
+                    msg_copy.custom_content.state = state.get(_GPA_MESSAGES)
+                    res_messages.append(msg_copy.dict(exclude_none=True))
+
+        # Add the current user message (always the last one)
+        last_message = messages[-1].dict(exclude_none=True)
+        
+        # Augment with coordinator instructions if provided
+        if additional_instructions:
+            current_content = last_message.get('content', '')
+            last_message['content'] = f"{current_content}\n\nAdditional context: {additional_instructions}"
+        
+        res_messages.append(last_message)
+
+        return res_messages
+
